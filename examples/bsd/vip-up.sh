@@ -1,4 +1,7 @@
 #! /bin/sh
 exec 2> /dev/null
 
-/sbin/ifconfig "$1" alias "$2" netmask 255.255.255.255
+# Extract IP address from CIDR notation (if present)
+ip_addr=$(echo "$2" | cut -d'/' -f1)
+
+/sbin/ifconfig "$1" alias "$ip_addr" netmask 255.255.255.255

@@ -70,7 +70,7 @@ struct carp_header {
         u_int16_t       carp_cksum;
         u_int32_t       carp_counter[2];
         unsigned char   carp_md[20];    /* SHA1 HMAC */
-} __packed;
+} __attribute__((packed));
 
 #define CARP_DFLTTL             255
 

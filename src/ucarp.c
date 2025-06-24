@@ -24,14 +24,14 @@ static void usage(void)
     puts("\n" PACKAGE_STRING " - " __DATE__ "\n");
     fputs(_(
         "--interface=<if> (-i <if>): bind interface <if>\n"
-        "--srcip=<ip> (-s <ip>): source (real) IP address of that host\n"
+        "--srcip=<ip[/prefix]> (-s <ip[/prefix]>): source (real) IP address of that host\n"
         "--mcast=<ip> (-m <ip>): multicast group IP address (default 224.0.0.18)\n"
         "--vhid=<id> (-v <id>): virtual IP identifier (1-255)\n"
         "--pass=<pass> (-p <pass>): password\n"
         "--passfile=<file> (-o <file>): read password from file\n"
         "--preempt (-P): becomes a master as soon as possible\n"
         "--neutral (-n): don't run downscript at start if backup\n"
-        "--addr=<ip> (-a <ip>): virtual shared IP address\n"
+        "--addr=<ip[/prefix]> (-a <ip[/prefix]>): virtual shared IP address\n"
         "--help (-h): summary of command-line options\n"
         "--advbase=<seconds> (-b <seconds>): advertisement frequency\n"
         "--advskew=<skew> (-k <skew>): advertisement skew (0-255)\n"
@@ -54,8 +54,8 @@ static void usage(void)
         "Call /etc/vip-up.sh when the host becomes a master, and\n"
         "/etc/vip-down.sh when the virtual IP address has to be disabled.\n"
         "\n"
-        "ucarp --interface=eth0 --srcip=10.1.1.1 --vhid=1 --pass=mypassword \\\n"
-        "      --addr=10.1.1.252 \\\n"
+        "ucarp --interface=eth0 --srcip=10.1.1.1/24 --vhid=1 --pass=mypassword \\\n"
+        "      --addr=10.1.1.252/24 \\\n"
         "      --upscript=/etc/vip-up.sh --downscript=/etc/vip-down.sh\n"
         "\n\n"
         "Please report bugs to "), stdout);
@@ -83,6 +83,50 @@ static void die_mem(void)
     logfile(LOG_ERR, _("Out of memory"));
 
     exit(EXIT_FAILURE);
+}
+
+int parse_cidr(const char *cidr_str, struct in_addr *addr, int *prefix)
+{
+    char *addr_str = NULL;
+    char *prefix_str = NULL;
+    char *slash_pos = NULL;
+    int result = 0;
+    
+    /* Make a copy of the input string */
+    addr_str = strdup(cidr_str);
+    if (addr_str == NULL) {
+        return -1;
+    }
+    
+    /* Look for the slash separator */
+    slash_pos = strchr(addr_str, '/');
+    if (slash_pos != NULL) {
+        /* Split the string at the slash */
+        *slash_pos = '\0';
+        prefix_str = slash_pos + 1;
+        
+        /* Parse the prefix length */
+        *prefix = (int) strtol(prefix_str, NULL, 10);
+        if (*prefix < 0 || *prefix > 32) {
+            logfile(LOG_ERR, _("Invalid prefix length: %d (must be 0-32)"), *prefix);
+            result = -1;
+            goto cleanup;
+        }
+    } else {
+        /* No slash found, assume /32 for host addresses */
+        *prefix = 32;
+    }
+    
+    /* Parse the IP address */
+    if (inet_pton(AF_INET, addr_str, addr) != 1) {
+        logfile(LOG_ERR, _("Invalid IP address: [%s]"), addr_str);
+        result = -1;
+        goto cleanup;
+    }
+    
+cleanup:
+    free(addr_str);
+    return result;
 }
 
 int main(int argc, char *argv[])
@@ -114,8 +158,7 @@ int main(int argc, char *argv[])
             break;
         }
         case 's': {
-            if (inet_pton(AF_INET, optarg, &srcip) == 0) {
-                logfile(LOG_ERR, _("Invalid address: [%s]"), optarg);
+            if (parse_cidr(optarg, &srcip, &srcip_prefix) != 0) {
                 return 1;
             }
             break;
@@ -179,8 +222,7 @@ int main(int argc, char *argv[])
         }
         case 'a': {
             free(vaddr_arg);
-            if (inet_pton(AF_INET, optarg, &vaddr) == 0) {
-                logfile(LOG_ERR, _("Invalid address: [%s]"), optarg);
+            if (parse_cidr(optarg, &vaddr, &vaddr_prefix) != 0) {
                 return 1;
             }
             vaddr_arg = strdup(optarg);

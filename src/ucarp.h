@@ -217,6 +217,7 @@ struct carp_softc {
 #define DEFAULT_FACILITY LOG_DAEMON
 
 int docarp(void);
+int parse_cidr(const char *cidr_str, struct in_addr *addr, int *prefix);
 
 #include "globals.h"
 

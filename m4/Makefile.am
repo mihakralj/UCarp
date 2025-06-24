@@ -1,4 +1,4 @@
-EXTRA_DIST = \
+EXTRA_DIST = host-cpu-c-abi.m4 \
 gettext.m4 \
 iconv.m4 \
 lib-ld.m4 \

@@ -11,10 +11,12 @@
 
 GLOBAL0(char *interface);
 GLOBAL0(struct in_addr srcip);
+GLOBAL0(int srcip_prefix);
 GLOBAL0(struct in_addr mcastip);
 GLOBAL0(unsigned char vhid);
 GLOBAL0(char *pass);
 GLOBAL0(struct in_addr vaddr);
+GLOBAL0(int vaddr_prefix);
 GLOBAL(unsigned char advbase, DEFAULT_ADVBASE);
 GLOBAL(unsigned int dead_ratio, DEFAULT_DEAD_RATIO);
 GLOBAL0(unsigned char advskew);

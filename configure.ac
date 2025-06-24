@@ -1,5 +1,5 @@
 AC_PREREQ(2.59)	
-AC_INIT([ucarp],[1.5.2])
+AC_INIT([ucarp],[1.6.0],[ucarp])
 AC_CONFIG_SRCDIR([src/ucarp.c])
 AC_CONFIG_HEADERS([config.h])
 AM_INIT_AUTOMAKE([1.9 dist-bzip2])

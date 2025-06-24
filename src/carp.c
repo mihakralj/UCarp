@@ -466,9 +466,109 @@ static void packethandler(unsigned char *dummy,
                 
         /* Process IPv6 CARP packet */
         if (proto == IPPROTO_CARP) {
-            logfile(LOG_DEBUG, "Processing IPv6 CARP packet");
-            /* For now, we'll skip IPv6 CARP processing and just log it */
-            /* TODO: Implement full IPv6 CARP packet processing */
+            struct carp_header ch;
+            unsigned long long tmp_counter;
+            struct timeval sc_tv;
+            struct timeval ch_tv;
+
+            logfile(LOG_DEBUG, "Processing IPv6 CARP packet - vhid check");
+            
+            if (caplen < ip_len + sizeof ch) {
+                logfile(LOG_DEBUG,
+                        "IPv6 CARP: Bogus size: caplen=[%u], ip_len=[%u] ch_len=[%u]",
+                        (unsigned int) caplen, (unsigned int) ip_len,
+                        (unsigned int) sizeof ch);
+                return;
+            }
+            
+            memcpy(&ch, sp + ip_len, sizeof ch);
+            
+            /* Validate CARP header */
+            if (ch.carp_version != CARP_VERSION) {
+                logfile(LOG_WARNING, _("IPv6 CARP: Bad version: [%u]"),
+                        (unsigned int) ch.carp_version);
+                return;
+            }
+            
+            if (ch.carp_vhid != vhid) {
+                logfile(LOG_DEBUG, _("IPv6 CARP: Ignoring vhid: [%u]"),
+                        (unsigned int) ch.carp_vhid);
+                return;
+            }
+            
+            logfile(LOG_DEBUG, "IPv6 CARP: Found matching vhid %u, processing master/backup logic", vhid);
+            
+            /* Verify HMAC authentication */
+            {
+                SHA1_CTX ctx;
+                unsigned char md2[20];
+
+                memcpy(&ctx, &sc.sc_sha1, sizeof ctx);
+                SHA1Update(&ctx,
+                           (void *) &ch.carp_counter, sizeof ch.carp_counter);
+                SHA1Final(md2, &ctx);
+
+                SHA1Init(&ctx);
+                SHA1Update(&ctx, sc.sc_pad, sizeof(sc.sc_pad));
+                SHA1Update(&ctx, md2, sizeof md2);
+                SHA1Final(md2, &ctx);
+
+                if (memcmp(md2, ch.carp_md, sizeof md2) != 0) {
+                    logfile(LOG_WARNING,
+                            _("IPv6 CARP: Bad digest - Check vhid, password and virtual IP address"));
+                    return;
+                }
+            }
+            
+            /* Update counter */
+            tmp_counter = ntohl(ch.carp_counter[0]);
+            tmp_counter = tmp_counter << 32;
+            tmp_counter += ntohl(ch.carp_counter[1]);
+            sc.sc_init_counter = 0;
+            sc.sc_counter = tmp_counter;
+
+            /* Calculate timing values for master election */
+            sc_tv.tv_sec = (unsigned int) sc.sc_advbase;
+            if (carp_suppress_preempt != 0 &&
+                sc.sc_advskew < CARP_BULK_UPDATE_MIN_DELAY) {
+                sc_tv.tv_usec = (unsigned int)
+                    (CARP_BULK_UPDATE_MIN_DELAY * 1000000ULL / 256ULL);
+            } else {
+                sc_tv.tv_usec = (unsigned int)
+                    (sc.sc_advskew * 1000000ULL / 256ULL);
+            }
+            ch_tv.tv_sec = (unsigned int) ch.carp_advbase;
+            ch_tv.tv_usec = (unsigned int)
+                (ch.carp_advskew * 1000000ULL / 256ULL);
+
+            logfile(LOG_DEBUG, "IPv6 CARP: Local advskew=%u, Remote advskew=%u", 
+                    sc.sc_advskew, ch.carp_advskew);
+
+            /* Process CARP state machine for IPv6 */
+            switch (sc.sc_state) {
+            case INIT:
+                logfile(LOG_DEBUG, "IPv6 CARP: In INIT state, ignoring");
+                break;
+            case MASTER:
+                /* If we receive an advertisement from a master with higher priority
+                 * (lower advskew), go into BACKUP state */
+                if (timercmp(&sc_tv, &ch_tv, >) ||
+                    (timercmp(&sc_tv, &ch_tv, ==) &&
+                        memcmp(&ip6head.ip6_src, &srcip6, sizeof(struct in6_addr)) < 0)) {
+                    
+                    logfile(LOG_WARNING, _("IPv6 CARP: Higher priority master advertised (advskew %u vs our %u): going to BACKUP state"),
+                            ch.carp_advskew, sc.sc_advskew);
+                    carp_send_ad(&sc);
+                    carp_set_state(&sc, BACKUP);
+                    carp_setrun(&sc, AF_INET6);
+                }
+                break;
+            case BACKUP:
+                /* Reset master down timer for IPv6 */
+                carp_setrun(&sc, AF_INET6);
+                logfile(LOG_DEBUG, "IPv6 CARP: Reset master down timer (advskew %u)", ch.carp_advskew);
+                break;
+            }
         }
         return;  /* Exit early for IPv6 packets */
     } else {

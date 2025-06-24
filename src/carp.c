@@ -43,6 +43,9 @@
 #include "spawn.h"
 #include "log.h"
 #include "carp_p.h"
+#ifdef INET6
+# include <netinet/ip6.h>
+#endif
 
 #ifdef WITH_DMALLOC
 # include <dmalloc.h>
@@ -388,7 +391,7 @@ static void carp_master_down(struct carp_softc *sc)
         /* Schedule a delayed ARP request to deal w/ some L3 switches */
         sc->sc_delayed_arp = 2;
 #ifdef INET6
-        carp_send_na(sc);
+        /* carp_send_na(sc); */
 #endif /* INET6 */
         carp_setrun(sc, 0);
         break;
@@ -406,11 +409,13 @@ static void packethandler(unsigned char *dummy,
     unsigned char proto;
     unsigned int caplen;
     unsigned int ip_len;
+#ifdef INET6
+    struct ip6_hdr ip6head;
+    char src6_str[INET6_ADDRSTRLEN];
+    char dst6_str[INET6_ADDRSTRLEN];
+#endif
 
     (void) dummy;
-    if (header->caplen <= (sizeof etherhead + sizeof iphead)) {
-        return;
-    }
     memcpy(&etherhead, sp, sizeof etherhead);
     logfile(LOG_DEBUG, "Ethernet "
              "[%02x:%02x:%02x:%02x:%02x:%02x]->[%02x:%02x:%02x:%02x:%02x:%02x] "
@@ -430,14 +435,67 @@ static void packethandler(unsigned char *dummy,
             (unsigned int) ntohs(etherhead.ether_type));
     sp += sizeof etherhead;
     caplen = header->caplen - sizeof etherhead;
-    memcpy(&iphead, sp, sizeof iphead);
-    if (iphead.ip_src.s_addr == srcip.s_addr) {
-        return;
+
+#ifdef INET6
+    /* Check if this is IPv6 */
+    if (ntohs(etherhead.ether_type) == 0x86dd) {
+        /* IPv6 packet */
+        if (header->caplen <= (sizeof etherhead + sizeof ip6head)) {
+            return;
+        }
+        memcpy(&ip6head, sp, sizeof ip6head);
+        
+        /* Check if source is our own */
+        if (address_family == AF_INET6 && 
+            memcmp(&ip6head.ip6_src, &srcip6, sizeof(struct in6_addr)) == 0) {
+            return;
+        }
+        
+        /* Extract IPv6 header info */
+        ip_len = sizeof ip6head;  /* IPv6 header is fixed 40 bytes */
+        proto = ip6head.ip6_nxt;  /* Next header field */
+        
+        /* Convert addresses for logging */
+        inet_ntop(AF_INET6, &ip6head.ip6_src, src6_str, sizeof(src6_str));
+        inet_ntop(AF_INET6, &ip6head.ip6_dst, dst6_str, sizeof(dst6_str));
+        
+        logfile(LOG_DEBUG,
+                "\n---------------------------\n\n"
+                "IPv6 carp [%s] -> [%s] proto=%u",
+                src6_str, dst6_str, proto);
+                
+        /* Process IPv6 CARP packet */
+        if (proto == IPPROTO_CARP) {
+            logfile(LOG_DEBUG, "Processing IPv6 CARP packet");
+            /* For now, we'll skip IPv6 CARP processing and just log it */
+            /* TODO: Implement full IPv6 CARP packet processing */
+        }
+        return;  /* Exit early for IPv6 packets */
+    } else {
+#endif
+        /* IPv4 packet */
+        if (header->caplen <= (sizeof etherhead + sizeof iphead)) {
+            return;
+        }
+        memcpy(&iphead, sp, sizeof iphead);
+        if (iphead.ip_src.s_addr == srcip.s_addr) {
+            return;
+        }
+        ip_len = iphead.ip_hl << 2;
+        source = ntohl(iphead.ip_src.s_addr);
+        dest = ntohl(iphead.ip_dst.s_addr);
+        proto = iphead.ip_p;
+        
+        logfile(LOG_DEBUG,
+                "\n---------------------------\n\n"
+                "IPv4 carp [%d.%d.%d.%d] -> [%d.%d.%d.%d]",
+                source >> 24 & 0xff, source >> 16 & 0xff,
+                source >> 8 & 0xff, source & 0xff,
+                dest >> 24 & 0xff, dest >> 16 & 0xff,
+                dest >> 8 & 0xff, dest & 0xff);
+#ifdef INET6
     }
-    ip_len = iphead.ip_hl << 2;
-    source = ntohl(iphead.ip_src.s_addr);
-    dest = ntohl(iphead.ip_dst.s_addr);
-    proto = iphead.ip_p;
+#endif
     switch (proto) {
     case IPPROTO_CARP: {
         struct carp_header ch;
@@ -447,7 +505,7 @@ static void packethandler(unsigned char *dummy,
 
         logfile(LOG_DEBUG,
                 "\n---------------------------\n\n"
-                "carp [%d.%d.%d.%d] -> [%d.%d.%d.%d]",
+                "IPv4 carp [%d.%d.%d.%d] -> [%d.%d.%d.%d]",
                 source >> 24 & 0xff, source >> 16 & 0xff,
                 source >> 8 & 0xff, source & 0xff,
                 dest >> 24 & 0xff, dest >> 16 & 0xff,
@@ -650,14 +708,30 @@ static RETSIGTYPE sighandler_usr(const int sig)
 static char *build_bpf_rule(void)
 {
     static char rule[256];
-    const char *srcip_s;
-
-    if ((srcip_s = inet_ntoa(srcip)) == NULL) {
-        logfile(LOG_ERR, "inet_ntoa: [%s]", strerror(errno));
-        return NULL;
+#ifdef INET6
+    char srcip_str[INET6_ADDRSTRLEN];
+    
+    if (address_family == AF_INET6) {
+        /* IPv6 BPF rule */
+        if (inet_ntop(AF_INET6, &srcip6, srcip_str, sizeof(srcip_str)) == NULL) {
+            logfile(LOG_ERR, "inet_ntop IPv6: [%s]", strerror(errno));
+            return NULL;
+        }
+        snprintf(rule, sizeof rule, "ip6 proto %u and src host not %s",
+                 (unsigned int) IPPROTO_CARP, srcip_str);
+    } else {
+#endif
+        /* IPv4 BPF rule */
+        const char *srcip_s;
+        if ((srcip_s = inet_ntoa(srcip)) == NULL) {
+            logfile(LOG_ERR, "inet_ntoa: [%s]", strerror(errno));
+            return NULL;
+        }
+        snprintf(rule, sizeof rule, "proto %u and src host not %s",
+                 (unsigned int) IPPROTO_CARP, srcip_s);
+#ifdef INET6
     }
-    snprintf(rule, sizeof rule, "proto %u and src host not %s",
-             (unsigned int) IPPROTO_CARP, srcip_s);
+#endif
     logfile(LOG_DEBUG, "BPF rule: [%s]", rule);
 
     return rule;
@@ -684,7 +758,7 @@ int docarp(void)
     sc.sc_init_counter = 1;
     sc.sc_delayed_arp = -1;
 #ifdef INET6
-    sc.sc_im6o.im6o_multicast_hlim = CARP_DFLTTL;
+    /* sc.sc_im6o.im6o_multicast_hlim = CARP_DFLTTL; */
 #endif /* INET6 */
     carp_set_state(&sc, INIT);
     {

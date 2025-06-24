@@ -15,6 +15,10 @@ Strong points of the CARP protocol are: very low overhead, cryptographically
 signed messages, interoperability between different operating systems and no
 need for any dedicated extra network link between redundant hosts.
 
+NEW in this version: Full IPv6 support! UCARP now supports both IPv4 and IPv6
+CARP protocols, with automatic detection and mixed environment compatibility.
+Enhanced CIDR notation support for both address families.
+
 
         ------------------------ COMPILATION ------------------------
 
@@ -103,11 +107,17 @@ switching MAC addresses.
 
 The called scripts are passed arguments, in this order:
 
-<interface name> <virtual address> <optional extra parameter>
+<interface name> <virtual address> <address family> <optional extra parameter>
 
-For instance, as the is passed as the first argument to the called scripts,
-feel free to replace "eth0" with "$1" and 10.1.1.252 by "$2" in the previous
-examples.
+Where:
+- $1 = interface name (e.g., "eth0")
+- $2 = virtual address with CIDR prefix (e.g., "10.1.1.252/24" or "[2001:db8::100]/64")
+- $3 = address family ("4" for IPv4, "6" for IPv6)
+- $4 = optional extra parameter (from --xparam)
+
+For instance, you can replace "eth0" with "$1" and 10.1.1.252/24 by "$2" in 
+the previous examples. Use "$3" to determine whether to use "ip" (IPv4) or 
+"ip -6" (IPv6) commands.
 
 Don't forget to make those files executable :
 
@@ -116,19 +126,63 @@ chmod +x /etc/vip-up.sh /etc/vip-down.sh
 Right. What we need now is an identifier for the virtual IP. Let's take "42".
 And we also need a password. Let's take "love".
 
-Now, on the first host (whoose real IP is 10.1.1.1), run :
+Now, on the first host (whose real IP is 10.1.1.1), run :
 
-/usr/local/sbin/ucarp -v 42 -p love -a 10.1.1.252 -s 10.1.1.1 &
+/usr/local/sbin/ucarp -v 42 -p love -a 10.1.1.252/24 -s 10.1.1.1/24 &
 
 On the second host, whose real IP is 10.1.1.2, run :
 
-/usr/local/sbin/ucarp -v 42 -p love -a 10.1.1.252 -s 10.1.1.2 &
+/usr/local/sbin/ucarp -v 42 -p love -a 10.1.1.252/24 -s 10.1.1.2/24 &
 
 You should see that one of those hosts quickly becomes the master, and the
 other one the backup. Related scripts are spawned on change.
 
 Now unplug the master. After a few seconds, the other host becomes the new
 master.
+
+                    ------------------------ IPv6 EXAMPLE ------------------------
+
+For IPv6 deployments, the process is identical except for address format.
+Let's say you want to share the IPv6 virtual address [2001:db8::100]/64
+between two hosts with real addresses [2001:db8::10]/64 and [2001:db8::20]/64.
+
+Create IPv6-aware scripts, /etc/vip-up-v6.sh :
+
+#! /bin/sh
+INTERFACE=$1
+VIP=$2
+ADDRESS_FAMILY=$3
+if [ "$ADDRESS_FAMILY" = "6" ]; then
+    /sbin/ip -6 addr add "$VIP" dev "$INTERFACE"
+else
+    /sbin/ip addr add "$VIP" dev "$INTERFACE"
+fi
+
+And /etc/vip-down-v6.sh :
+
+#! /bin/sh
+INTERFACE=$1
+VIP=$2
+ADDRESS_FAMILY=$3
+if [ "$ADDRESS_FAMILY" = "6" ]; then
+    /sbin/ip -6 addr del "$VIP" dev "$INTERFACE"
+else
+    /sbin/ip addr del "$VIP" dev "$INTERFACE"
+fi
+
+Make them executable:
+chmod +x /etc/vip-up-v6.sh /etc/vip-down-v6.sh
+
+On the first IPv6 host ([2001:db8::10]/64), run:
+/usr/local/sbin/ucarp -v 42 -p love -a "[2001:db8::100]/64" -s "[2001:db8::10]/64" \
+                     -u /etc/vip-up-v6.sh -d /etc/vip-down-v6.sh &
+
+On the second IPv6 host ([2001:db8::20]/64), run:
+/usr/local/sbin/ucarp -v 42 -p love -a "[2001:db8::100]/64" -s "[2001:db8::20]/64" \
+                     -u /etc/vip-up-v6.sh -d /etc/vip-down-v6.sh &
+
+UCarp automatically detects IPv6 addresses and handles IPv6 CARP protocol
+appropriately. Mixed IPv4/IPv6 environments are fully supported.
 
 
 ------------------------ MULTICAST IP SELECTION -------------------------

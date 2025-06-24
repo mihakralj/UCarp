@@ -13,22 +13,35 @@
 int spawn_handler(const int dev_desc_fd, const char * const script)
 {
     pid_t pid;
+    const char *addr_arg;
 
     if (script == NULL || *script == 0) {
         return 0;
     }
+    
+    /* Choose the appropriate address argument based on address family */
+#ifdef INET6
+    if (address_family == AF_INET6) {
+        addr_arg = vaddr6_arg;
+    } else {
+        addr_arg = vaddr_arg;
+    }
+#else
+    addr_arg = vaddr_arg;
+#endif
+
     pid = fork();
     if (pid == (pid_t) 0) {
         (void) close(dev_desc_fd);
-        execl(script, script, interface, vaddr_arg, xparam, (char *) NULL);
+        execl(script, script, interface, addr_arg, xparam, (char *) NULL);
         logfile(LOG_ERR, _("Unable to exec %s %s %s%s%s: %s"),
-                script, interface, vaddr_arg,
+                script, interface, addr_arg,
                 (xparam ? " " : ""), (xparam ? xparam : ""),
                 strerror(errno));
         _exit(EXIT_FAILURE);
     } else if (pid != (pid_t) -1) {
         logfile(LOG_WARNING, _("Spawning [%s %s %s%s%s]"),
-                script, interface, vaddr_arg,
+                script, interface, addr_arg,
                 (xparam ? " " : ""), (xparam ? xparam : ""));
 #ifdef HAVE_WAITPID
         {

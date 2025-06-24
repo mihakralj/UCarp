@@ -129,6 +129,92 @@ cleanup:
     return result;
 }
 
+#ifdef INET6
+int is_ipv6_address(const char *addr_str)
+{
+    if (addr_str == NULL || strlen(addr_str) < 3) {
+        return 0;
+    }
+    
+    /* IPv6 addresses must be in brackets: [addr] */
+    return (addr_str[0] == '[' && strchr(addr_str, ']') != NULL);
+}
+
+int parse_ipv6_cidr(const char *cidr_str, struct in6_addr *addr, int *prefix)
+{
+    char *addr_str = NULL;
+    char *prefix_str = NULL;
+    char *bracket_start = NULL;
+    char *bracket_end = NULL;
+    char *slash_pos = NULL;
+    int result = 0;
+    size_t addr_len;
+    
+    if (cidr_str == NULL || addr == NULL || prefix == NULL) {
+        return -1;
+    }
+    
+    /* Make a copy of the input string */
+    addr_str = strdup(cidr_str);
+    if (addr_str == NULL) {
+        return -1;
+    }
+    
+    /* IPv6 addresses must be in brackets: [addr]/prefix or [addr] */
+    bracket_start = strchr(addr_str, '[');
+    bracket_end = strchr(addr_str, ']');
+    
+    if (bracket_start == NULL || bracket_end == NULL || bracket_start != addr_str) {
+        logfile(LOG_ERR, _("Invalid IPv6 format: [%s] - must be [address]/prefix"), cidr_str);
+        result = -1;
+        goto cleanup;
+    }
+    
+    if (bracket_end <= bracket_start + 1) {
+        logfile(LOG_ERR, _("Empty IPv6 address in brackets: [%s]"), cidr_str);
+        result = -1;
+        goto cleanup;
+    }
+    
+    /* Look for prefix after the closing bracket */
+    slash_pos = strchr(bracket_end, '/');
+    if (slash_pos != NULL) {
+        prefix_str = slash_pos + 1;
+        
+        /* Parse the prefix length */
+        *prefix = (int) strtol(prefix_str, NULL, 10);
+        if (*prefix < 0 || *prefix > 128) {
+            logfile(LOG_ERR, _("Invalid IPv6 prefix length: %d (must be 0-128)"), *prefix);
+            result = -1;
+            goto cleanup;
+        }
+    } else {
+        /* No slash found, assume /128 for host addresses */
+        *prefix = 128;
+    }
+    
+    /* Extract IPv6 address from between brackets */
+    *bracket_end = '\0';  /* Terminate the address string */
+    addr_len = bracket_end - (bracket_start + 1);
+    if (addr_len == 0) {
+        logfile(LOG_ERR, _("Empty IPv6 address: [%s]"), cidr_str);
+        result = -1;
+        goto cleanup;
+    }
+    
+    /* Parse the IPv6 address */
+    if (inet_pton(AF_INET6, bracket_start + 1, addr) != 1) {
+        logfile(LOG_ERR, _("Invalid IPv6 address: [%s]"), bracket_start + 1);
+        result = -1;
+        goto cleanup;
+    }
+    
+cleanup:
+    free(addr_str);
+    return result;
+}
+#endif /* INET6 */
+
 int main(int argc, char *argv[])
 {
     int option_index = 0;

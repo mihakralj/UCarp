@@ -53,6 +53,9 @@
 # include <netinet/in.h>
 #endif
 #include <arpa/inet.h>
+#ifdef INET6
+# include <netinet/in6.h>
+#endif
 #ifdef HAVE_NETINET_IN_SYSTM_H
 # include <netinet/in_systm.h>
 #endif
@@ -218,6 +221,10 @@ struct carp_softc {
 
 int docarp(void);
 int parse_cidr(const char *cidr_str, struct in_addr *addr, int *prefix);
+#ifdef INET6
+int parse_ipv6_cidr(const char *cidr_str, struct in6_addr *addr, int *prefix);
+int is_ipv6_address(const char *addr_str);
+#endif
 
 #include "globals.h"
 

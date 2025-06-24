@@ -466,3 +466,4 @@
 
 /* Define as `fork' if `vfork' does not work. */
 /* #undef vfork */
+#define INET6 1

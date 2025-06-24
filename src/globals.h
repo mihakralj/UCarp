@@ -12,6 +12,14 @@
 GLOBAL0(char *interface);
 GLOBAL0(struct in_addr srcip);
 GLOBAL0(int srcip_prefix);
+#ifdef INET6
+GLOBAL0(struct in6_addr srcip6);
+GLOBAL0(int srcip6_prefix);
+GLOBAL0(struct in6_addr vaddr6);
+GLOBAL0(int vaddr6_prefix);
+GLOBAL0(char *vaddr6_arg);
+GLOBAL0(int address_family);  /* AF_INET or AF_INET6 */
+#endif
 GLOBAL0(struct in_addr mcastip);
 GLOBAL0(unsigned char vhid);
 GLOBAL0(char *pass);

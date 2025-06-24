@@ -244,9 +244,23 @@ int main(int argc, char *argv[])
             break;
         }
         case 's': {
-            if (parse_cidr(optarg, &srcip, &srcip_prefix) != 0) {
-                return 1;
+#ifdef INET6
+            if (is_ipv6_address(optarg)) {
+                /* IPv6 address detected */
+                if (parse_ipv6_cidr(optarg, &srcip6, &srcip6_prefix) != 0) {
+                    return 1;
+                }
+                address_family = AF_INET6;
+            } else {
+#endif
+                /* IPv4 address */
+                if (parse_cidr(optarg, &srcip, &srcip_prefix) != 0) {
+                    return 1;
+                }
+#ifdef INET6
+                address_family = AF_INET;
             }
+#endif
             break;
         }
         case 'm': {
@@ -308,10 +322,36 @@ int main(int argc, char *argv[])
         }
         case 'a': {
             free(vaddr_arg);
-            if (parse_cidr(optarg, &vaddr, &vaddr_prefix) != 0) {
-                return 1;
+#ifdef INET6
+            free(vaddr6_arg);
+            if (is_ipv6_address(optarg)) {
+                /* IPv6 virtual address */
+                if (parse_ipv6_cidr(optarg, &vaddr6, &vaddr6_prefix) != 0) {
+                    return 1;
+                }
+                vaddr6_arg = strdup(optarg);
+                /* Check if we already set address family from srcip */
+                if (address_family != 0 && address_family != AF_INET6) {
+                    logfile(LOG_ERR, _("Mixed address families: srcip is IPv4 but addr is IPv6"));
+                    return 1;
+                }
+                address_family = AF_INET6;
+            } else {
+#endif
+                /* IPv4 virtual address */
+                if (parse_cidr(optarg, &vaddr, &vaddr_prefix) != 0) {
+                    return 1;
+                }
+                vaddr_arg = strdup(optarg);
+#ifdef INET6
+                /* Check if we already set address family from srcip */
+                if (address_family != 0 && address_family != AF_INET) {
+                    logfile(LOG_ERR, _("Mixed address families: srcip is IPv6 but addr is IPv4"));
+                    return 1;
+                }
+                address_family = AF_INET;
             }
-            vaddr_arg = strdup(optarg);
+#endif
             break;
         }
         case 'b': {
@@ -415,14 +455,31 @@ int main(int argc, char *argv[])
         logfile(LOG_ERR, _("You must supply an advertisement time base"));
         return 1;
     }
-    if (srcip.s_addr == 0) {
-        logfile(LOG_ERR, _("You must supply a persistent source address"));
-        return 1;
+#ifdef INET6
+    if (address_family == AF_INET6) {
+        /* IPv6 validation */
+        if (IN6_IS_ADDR_UNSPECIFIED(&srcip6)) {
+            logfile(LOG_ERR, _("You must supply a persistent source address"));
+            return 1;
+        }
+        if (IN6_IS_ADDR_UNSPECIFIED(&vaddr6)) {
+            logfile(LOG_ERR, _("You must supply a virtual host address"));
+            return 1;
+        }
+    } else {
+#endif
+        /* IPv4 validation */
+        if (srcip.s_addr == 0) {
+            logfile(LOG_ERR, _("You must supply a persistent source address"));
+            return 1;
+        }
+        if (vaddr.s_addr == 0) {
+            logfile(LOG_ERR, _("You must supply a virtual host address"));
+            return 1;
+        }
+#ifdef INET6
     }
-    if (vaddr.s_addr == 0) {
-        logfile(LOG_ERR, _("You must supply a virtual host address"));
-        return 1;
-    }
+#endif
     if (upscript == NULL) {
         logfile(LOG_WARNING, _("Warning: no script called when going up"));
     }

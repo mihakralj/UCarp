@@ -53,9 +53,6 @@
 # include <netinet/in.h>
 #endif
 #include <arpa/inet.h>
-#ifdef INET6
-# include <netinet/in6.h>
-#endif
 #ifdef HAVE_NETINET_IN_SYSTM_H
 # include <netinet/in_systm.h>
 #endif
@@ -177,8 +174,9 @@ struct carp_softc {
     struct ifnet *sc_ifp;
     struct in_ifaddr *sc_ia;    /* primary iface address */
 #ifdef INET6
-    struct in6_ifaddr *sc_ia6;  /* primary iface address v6 */
-    struct ip6_moptions sc_im6o;
+    /* IPv6 support - simplified for Phase 2 testing */
+    void *sc_ia6;  /* IPv6 interface address (placeholder) */
+    void *sc_im6o; /* IPv6 multicast options (placeholder) */
 #endif /* INET6 */
 
     enum { INIT = 0, BACKUP, MASTER }   sc_state;

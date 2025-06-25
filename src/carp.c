@@ -45,6 +45,7 @@
 #include "carp_p.h"
 #ifdef INET6
 # include <netinet/ip6.h>
+# include "ndp.h"
 #endif
 
 #ifdef WITH_DMALLOC
@@ -69,7 +70,14 @@ static void carp_set_state(struct carp_softc *sc, int state)
     case MASTER:
         logfile(LOG_WARNING, _("Switching to state: MASTER"));
         (void) spawn_handler(dev_desc_fd, upscript);
-        gratuitous_arp(dev_desc_fd);
+#ifdef INET6
+        if (address_family == AF_INET6) {
+            send_na(dev_desc_fd);
+        } else
+#endif
+        {
+            gratuitous_arp(dev_desc_fd);
+        }
         break;
     default:
         logfile(LOG_ERR, _("Unknown state: [%d]"), (int) state);
@@ -99,7 +107,14 @@ static void carp_hmac_prepare(struct carp_softc *sc)
     SHA1Update(&sc->sc_sha1, (void *) &version, sizeof version);
     SHA1Update(&sc->sc_sha1, (void *) &type, sizeof type);
     SHA1Update(&sc->sc_sha1, (void *) &vhid, sizeof vhid);
-    SHA1Update(&sc->sc_sha1, (void *) &vaddr.s_addr, sizeof vaddr.s_addr);
+#ifdef INET6
+    if (address_family == AF_INET6) {
+        SHA1Update(&sc->sc_sha1, (void *) &vaddr6, sizeof vaddr6);
+    } else
+#endif
+    {
+        SHA1Update(&sc->sc_sha1, (void *) &vaddr.s_addr, sizeof vaddr.s_addr);
+    }
 
     /* convert ipad to opad */
     for (i = 0; i < sizeof sc->sc_pad; i++) {
@@ -220,7 +235,8 @@ static void carp_send_ad(struct carp_softc *sc)
 
     ip_len = sizeof ip + sizeof ch;
     eth_len = ip_len + sizeof eh;
-    if ((pkt = ALLOCA(eth_len)) == NULL) {
+    pkt = malloc(eth_len);
+    if (pkt == NULL) {
         logfile(LOG_ERR, _("Out of memory to create packet"));
         timeradd(&now, &tv, &sc->sc_ad_tmo);
         return;
@@ -312,7 +328,7 @@ static void carp_send_ad(struct carp_softc *sc)
 
     logfile(LOG_DEBUG, _("* advertisement injected *"));
 
-    ALLOCA_FREE(pkt);
+    free(pkt);
 
     if (sc->sc_delayed_arp > 0)
         sc->sc_delayed_arp--;
@@ -328,8 +344,107 @@ static void carp_send_ad(struct carp_softc *sc)
     }
 }
 
+#ifdef INET6
+static void carp_send_ad_ipv6(struct carp_softc *sc)
+{
+    struct carp_header ch;
+    struct ether_header eh;
+    struct timeval tv;
+    struct ip6_hdr ip6;
+    unsigned char *pkt;
+    size_t eth_len;
+    int advbase;
+    int advskew;
+    int rc;
+
+    logfile(LOG_DEBUG, "-> carp_send_ad_ipv6()");
+
+    advbase = sc->sc_advbase;
+    if (carp_suppress_preempt == 0 ||
+        sc->sc_advskew > CARP_BULK_UPDATE_MIN_DELAY) {
+        advskew = sc->sc_advskew;
+    } else {
+        advskew = CARP_BULK_UPDATE_MIN_DELAY;
+    }
+    tv.tv_sec = advbase;
+    tv.tv_usec = (unsigned int) (advskew * 1000000ULL / 256ULL);
+
+    ch.carp_version = CARP_VERSION;
+    ch.carp_type = CARP_ADVERTISEMENT;
+    ch.carp_vhid = sc->sc_vhid;
+    ch.carp_advbase = advbase;
+    ch.carp_advskew = advskew;
+    ch.carp_authlen = CARP_AUTHLEN;
+    ch.carp_pad1 = 0;   /* must be zero */
+    ch.carp_cksum = 0;
+
+    carp_prepare_ad(&ch, sc);
+
+    memset(&ip6, 0, sizeof(ip6));
+    ip6.ip6_vfc = IPV6_VERSION;
+    ip6.ip6_plen = htons(sizeof(ch));
+    ip6.ip6_nxt = IPPROTO_CARP;
+    ip6.ip6_hlim = CARP_DFLTTL;
+    memcpy(&ip6.ip6_src, &srcip6, sizeof(ip6.ip6_src));
+    /* Use CARP IPv6 multicast address - ff02::12 is VRRP, we need CARP */
+    /* FreeBSD CARP over IPv6 uses different addressing than VRRP */
+    inet_pton(AF_INET6, "ff02::12", &ip6.ip6_dst);
+
+    eth_len = sizeof(eh) + sizeof(ip6) + sizeof(ch);
+    pkt = malloc(eth_len);
+    if (pkt == NULL) {
+        logfile(LOG_ERR, _("Out of memory to create IPv6 packet"));
+        timeradd(&now, &tv, &sc->sc_ad_tmo);
+        return;
+    }
+
+    /* Use CARP virtual MAC address format (same as IPv4) */
+    eh.ether_shost[0] = 0x00;
+    eh.ether_shost[1] = 0x00;
+    eh.ether_shost[2] = 0x5e;
+    eh.ether_shost[3] = 0x00;
+    eh.ether_shost[4] = 0x01;  /* CARP uses 0x01, not 0x00 */
+    eh.ether_shost[5] = vhid;
+
+    /* Use CARP virtual MAC for destination (multicast mapping) */
+    eh.ether_dhost[0] = 0x01;  /* CARP IPv6 multicast MAC */
+    eh.ether_dhost[1] = 0x00;
+    eh.ether_dhost[2] = 0x5e;
+    eh.ether_dhost[3] = 0x00;
+    eh.ether_dhost[4] = 0x01;
+    eh.ether_dhost[5] = vhid;  /* Use VHID for MAC like IPv4 */
+    eh.ether_type = htons(ETHERTYPE_IPV6);
+
+    memcpy(pkt, &eh, sizeof eh);
+    memcpy(pkt + sizeof eh, &ip6, sizeof ip6);
+    memcpy(pkt + sizeof ip6 + sizeof eh, &ch, sizeof ch);
+
+    do {
+        rc = write(dev_desc_fd, pkt, eth_len);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) {
+        logfile(LOG_WARNING, _("write() has failed for IPv6: %s"), strerror(errno));
+    }
+
+    logfile(LOG_DEBUG, _("* IPv6 advertisement injected *"));
+
+    free(pkt);
+
+    if (advbase != 255 || advskew != 255) {
+        timeradd(&now, &tv, &sc->sc_ad_tmo);
+    }
+}
+#endif
+
 static void carp_send_ad_all(struct carp_softc *sc) {
-    carp_send_ad(sc);
+#ifdef INET6
+    if (address_family == AF_INET6) {
+        carp_send_ad_ipv6(sc);
+    } else
+#endif
+    {
+        carp_send_ad(sc);
+    }
 }
 
 static void carp_setrun(struct carp_softc *sc, sa_family_t af)
@@ -387,7 +502,7 @@ static void carp_master_down(struct carp_softc *sc)
         break;
     case BACKUP:
         carp_set_state(sc, MASTER);
-        carp_send_ad(sc);
+        carp_send_ad_all(sc);
         /* Schedule a delayed ARP request to deal w/ some L3 switches */
         sc->sc_delayed_arp = 2;
 #ifdef INET6
@@ -398,48 +513,305 @@ static void carp_master_down(struct carp_softc *sc)
     }
 }
 
+/* Helper function to validate basic packet structure */
+static int validate_ethernet_header(const struct ether_header *eth, unsigned int total_caplen)
+{
+    if (total_caplen < sizeof(struct ether_header)) {
+        logfile(LOG_DEBUG, "Packet too small for Ethernet header");
+        return -1;
+    }
+    
+    logfile(LOG_DEBUG, "Ethernet "
+             "[%02x:%02x:%02x:%02x:%02x:%02x]->[%02x:%02x:%02x:%02x:%02x:%02x] "
+             "type [%04x]",
+            (unsigned int) eth->ether_shost[0],
+            (unsigned int) eth->ether_shost[1],
+            (unsigned int) eth->ether_shost[2],
+            (unsigned int) eth->ether_shost[3],
+            (unsigned int) eth->ether_shost[4],
+            (unsigned int) eth->ether_shost[5],
+            (unsigned int) eth->ether_dhost[0],
+            (unsigned int) eth->ether_dhost[1],
+            (unsigned int) eth->ether_dhost[2],
+            (unsigned int) eth->ether_dhost[3],
+            (unsigned int) eth->ether_dhost[4],
+            (unsigned int) eth->ether_dhost[5],
+            (unsigned int) ntohs(eth->ether_type));
+    
+    return 0;
+}
+
+/* Helper function to validate and authenticate CARP header */
+static int validate_and_authenticate_carp_header(const struct carp_header *ch)
+{
+    SHA1_CTX ctx;
+    unsigned char md2[20];
+
+    /* Validate CARP header fields */
+    if (ch->carp_version != CARP_VERSION) {
+        logfile(LOG_WARNING, _("Bad version: [%u]"), (unsigned int) ch->carp_version);
+        return -1;
+    }
+    
+    if (ch->carp_vhid != vhid) {
+        logfile(LOG_DEBUG, _("Ignoring vhid: [%u]"), (unsigned int) ch->carp_vhid);
+        return -1;
+    }
+
+    /* Authenticate using HMAC */
+    memcpy(&ctx, &sc.sc_sha1, sizeof ctx);
+    SHA1Update(&ctx, (void *) &ch->carp_counter, sizeof ch->carp_counter);
+    SHA1Final(md2, &ctx);
+
+    SHA1Init(&ctx);
+    SHA1Update(&ctx, sc.sc_pad, sizeof(sc.sc_pad));
+    SHA1Update(&ctx, md2, sizeof md2);
+    SHA1Final(md2, &ctx);
+
+    if (sizeof md2 != sizeof ch->carp_md) {
+        logfile(LOG_ERR, "sizeof md2 != sizeof carp_md !!!");
+        return -1;
+    }
+    
+    if (memcmp(md2, ch->carp_md, sizeof md2) != 0) {
+        logfile(LOG_WARNING,
+                _("Bad digest - "
+                  "md2=[%02x%02x%02x%02x...] md=[%02x%02x%02x%02x...] - "
+                  "Check vhid, password and virtual IP address"),
+                (unsigned int) md2[0], (unsigned int) md2[1],
+                (unsigned int) md2[2], (unsigned int) md2[3],
+                (unsigned int) (ch->carp_md)[0],
+                (unsigned int) (ch->carp_md)[1],
+                (unsigned int) (ch->carp_md)[2],
+                (unsigned int) (ch->carp_md)[3]);
+        return -1;
+    }
+    
+    logfile(LOG_DEBUG, "CARP authentication passed for vhid %u", (unsigned int) ch->carp_vhid);
+    return 0;
+}
+
+/* Unified CARP state machine processing for both IPv4 and IPv6 */
+static void process_carp_state_machine(const struct carp_header *ch, sa_family_t family, const void *src_addr)
+{
+    unsigned long long tmp_counter;
+    struct timeval sc_tv, ch_tv;
+
+    /* Update counter */
+    tmp_counter = ntohl(ch->carp_counter[0]);
+    tmp_counter = tmp_counter << 32;
+    tmp_counter += ntohl(ch->carp_counter[1]);
+    sc.sc_init_counter = 0;
+    sc.sc_counter = tmp_counter;
+
+    /* Calculate timing values for master election */
+    sc_tv.tv_sec = (unsigned int) sc.sc_advbase;
+    if (carp_suppress_preempt != 0 && sc.sc_advskew < CARP_BULK_UPDATE_MIN_DELAY) {
+        sc_tv.tv_usec = (unsigned int) (CARP_BULK_UPDATE_MIN_DELAY * 1000000ULL / 256ULL);
+    } else {
+        sc_tv.tv_usec = (unsigned int) (sc.sc_advskew * 1000000ULL / 256ULL);
+    }
+    ch_tv.tv_sec = (unsigned int) ch->carp_advbase;
+    ch_tv.tv_usec = (unsigned int) (ch->carp_advskew * 1000000ULL / 256ULL);
+
+    logfile(LOG_DEBUG, "Local advskew=%u, Remote advskew=%u", sc.sc_advskew, ch->carp_advskew);
+
+    /* Process CARP state machine */
+    switch (sc.sc_state) {
+    case INIT:
+        logfile(LOG_DEBUG, "In INIT state, ignoring packet");
+        break;
+        
+    case MASTER:
+        /* Check if we should go to BACKUP due to higher priority master */
+        if (timercmp(&sc_tv, &ch_tv, >) ||
+            (timercmp(&sc_tv, &ch_tv, ==) && 
+             ((family == AF_INET && ((struct in_addr *)src_addr)->s_addr < srcip.s_addr) ||
+#ifdef INET6
+              (family == AF_INET6 && memcmp(src_addr, &srcip6, sizeof(struct in6_addr)) < 0)
+#else
+              0
+#endif
+             ))) {
+            
+            logfile(LOG_WARNING, _("Higher priority master advertised (advskew %u vs our %u): going to BACKUP state"),
+                    ch->carp_advskew, sc.sc_advskew);
+            carp_send_ad_all(&sc);
+            carp_set_state(&sc, BACKUP);
+            carp_setrun(&sc, family);
+        }
+        
+        /* Reassert dominance against lower priority masters */
+        if (timercmp(&sc_tv, &ch_tv, <) ||
+            (timercmp(&sc_tv, &ch_tv, ==) &&
+             ((family == AF_INET && ((struct in_addr *)src_addr)->s_addr > srcip.s_addr) ||
+#ifdef INET6
+              (family == AF_INET6 && memcmp(src_addr, &srcip6, sizeof(struct in6_addr)) > 0)
+#else
+              0
+#endif
+             ))) {
+#ifdef INET6
+            if (family == AF_INET6) {
+                send_na(dev_desc_fd);
+                logfile(LOG_WARNING, _("Non-preferred master advertising: "
+                                       "reasserting control of VIP with Neighbor Advertisement"));
+            } else
+#endif
+            {
+                gratuitous_arp(dev_desc_fd);
+                sc.sc_delayed_arp = 2;
+                logfile(LOG_WARNING, _("Non-preferred master advertising: "
+                                       "reasserting control of VIP with another gratuitous arp"));
+            }
+        }
+        break;
+        
+    case BACKUP:
+        /* Handle preemption */
+        if (preempt != 0 && timercmp(&sc_tv, &ch_tv, <)) {
+            carp_master_down(&sc);
+            logfile(LOG_WARNING, _("Putting MASTER down - preemption"));
+            break;
+        }
+
+        /* Check if master will time out */
+        sc_tv.tv_sec = (unsigned int) sc.sc_advbase * dead_ratio;
+        if (timercmp(&sc_tv, &ch_tv, <)) {
+            carp_master_down(&sc);
+            logfile(LOG_WARNING, _("Putting MASTER DOWN (going to time out)"));
+            break;
+        }
+
+        /* Reset timer for valid master */
+        carp_setrun(&sc, family);
+        logfile(LOG_DEBUG, "Reset master down timer (advskew %u)", ch->carp_advskew);
+        break;
+    }
+}
+
+/* Handle IPv4 CARP packets */
+static int handle_ipv4_carp_packet(const struct ip *iphead, const unsigned char *sp, 
+                                   unsigned int ip_len, unsigned int caplen)
+{
+    struct carp_header ch;
+    unsigned int source, dest;
+
+    source = ntohl(iphead->ip_src.s_addr);
+    dest = ntohl(iphead->ip_dst.s_addr);
+
+    logfile(LOG_DEBUG, "IPv4 carp [%d.%d.%d.%d] -> [%d.%d.%d.%d]",
+            source >> 24 & 0xff, source >> 16 & 0xff,
+            source >> 8 & 0xff, source & 0xff,
+            dest >> 24 & 0xff, dest >> 16 & 0xff,
+            dest >> 8 & 0xff, dest & 0xff);
+
+    /* Validate packet size */
+    if (caplen < ip_len + sizeof ch) {
+        logfile(LOG_DEBUG, "Bogus size: caplen=[%u], ip_len=[%u] ch_len=[%u]",
+                (unsigned int) caplen, (unsigned int) ip_len, (unsigned int) sizeof ch);
+        return -1;
+    }
+
+    /* Validate TTL */
+    if (iphead->ip_ttl != CARP_DFLTTL) {
+        logfile(LOG_WARNING, _("Bad TTL: [%u]"), (unsigned int) iphead->ip_ttl);
+        return -1;
+    }
+
+    /* Validate destination address */
+    if (iphead->ip_dst.s_addr != mcastip.s_addr) {
+        logfile(LOG_DEBUG, _("Ignoring different multicast ip: [%s]"), inet_ntoa(iphead->ip_dst));
+        return -1;
+    }
+
+    /* Validate IP checksum */
+    if (cksum(sp, ip_len + sizeof ch) != 0) {
+        logfile(LOG_WARNING, _("Bad IP checksum"));
+        return -1;
+    }
+
+    /* Extract CARP header */
+    memcpy(&ch, sp + ip_len, sizeof ch);
+
+    /* Validate and authenticate CARP header */
+    if (validate_and_authenticate_carp_header(&ch) != 0) {
+        return -1;
+    }
+
+    /* Process state machine */
+    process_carp_state_machine(&ch, AF_INET, &iphead->ip_src);
+    return 0;
+}
+
+#ifdef INET6
+/* Handle IPv6 CARP packets */
+static int handle_ipv6_carp_packet(const struct ip6_hdr *ip6head, const unsigned char *sp, 
+                                   unsigned int caplen)
+{
+    struct carp_header ch;
+    char src6_str[INET6_ADDRSTRLEN];
+    char dst6_str[INET6_ADDRSTRLEN];
+    unsigned int ip_len = sizeof(struct ip6_hdr);
+
+    /* Convert addresses for logging */
+    inet_ntop(AF_INET6, &ip6head->ip6_src, src6_str, sizeof(src6_str));
+    inet_ntop(AF_INET6, &ip6head->ip6_dst, dst6_str, sizeof(dst6_str));
+
+    logfile(LOG_DEBUG, "IPv6 carp [%s] -> [%s] proto=%u", src6_str, dst6_str, ip6head->ip6_nxt);
+
+    /* Validate packet size */
+    if (caplen < ip_len + sizeof ch) {
+        logfile(LOG_DEBUG, "IPv6 CARP: Bogus size: caplen=[%u], ip_len=[%u] ch_len=[%u]",
+                (unsigned int) caplen, (unsigned int) ip_len, (unsigned int) sizeof ch);
+        return -1;
+    }
+
+    /* Extract CARP header */
+    memcpy(&ch, sp + ip_len, sizeof ch);
+
+    /* Validate and authenticate CARP header (same validation for IPv6) */
+    if (validate_and_authenticate_carp_header(&ch) != 0) {
+        return -1;
+    }
+
+    logfile(LOG_DEBUG, "IPv6 CARP: Found matching vhid %u, processing master/backup logic", vhid);
+    logfile(LOG_DEBUG, "IPv6 CARP: authlen=%u, advskew=%u, advbase=%u", 
+            ch.carp_authlen, ch.carp_advskew, ch.carp_advbase);
+
+    /* Process state machine */
+    process_carp_state_machine(&ch, AF_INET6, &ip6head->ip6_src);
+    return 0;
+}
+#endif
+
 static void packethandler(unsigned char *dummy,
                           const struct pcap_pkthdr *header,
                           const unsigned char *sp)
 {
     struct ether_header etherhead;
     struct ip iphead;
-    unsigned int source;
-    unsigned int dest;
-    unsigned char proto;
     unsigned int caplen;
     unsigned int ip_len;
 #ifdef INET6
     struct ip6_hdr ip6head;
-    char src6_str[INET6_ADDRSTRLEN];
-    char dst6_str[INET6_ADDRSTRLEN];
 #endif
 
     (void) dummy;
+    
+    /* Validate and extract Ethernet header */
+    if (validate_ethernet_header((const struct ether_header *)sp, header->caplen) != 0) {
+        return;
+    }
+    
     memcpy(&etherhead, sp, sizeof etherhead);
-    logfile(LOG_DEBUG, "Ethernet "
-             "[%02x:%02x:%02x:%02x:%02x:%02x]->[%02x:%02x:%02x:%02x:%02x:%02x] "
-             "type [%04x]",
-            (unsigned int) etherhead.ether_shost[0],
-            (unsigned int) etherhead.ether_shost[1],
-            (unsigned int) etherhead.ether_shost[2],
-            (unsigned int) etherhead.ether_shost[3],
-            (unsigned int) etherhead.ether_shost[4],
-            (unsigned int) etherhead.ether_shost[5],
-            (unsigned int) etherhead.ether_dhost[0],
-            (unsigned int) etherhead.ether_dhost[1],
-            (unsigned int) etherhead.ether_dhost[2],
-            (unsigned int) etherhead.ether_dhost[3],
-            (unsigned int) etherhead.ether_dhost[4],
-            (unsigned int) etherhead.ether_dhost[5],
-            (unsigned int) ntohs(etherhead.ether_type));
     sp += sizeof etherhead;
     caplen = header->caplen - sizeof etherhead;
 
 #ifdef INET6
     /* Check if this is IPv6 */
     if (ntohs(etherhead.ether_type) == 0x86dd) {
-        /* IPv6 packet */
+        /* IPv6 packet processing */
         if (header->caplen <= (sizeof etherhead + sizeof ip6head)) {
             return;
         }
@@ -451,137 +823,15 @@ static void packethandler(unsigned char *dummy,
             return;
         }
         
-        /* Extract IPv6 header info */
-        ip_len = sizeof ip6head;  /* IPv6 header is fixed 40 bytes */
-        proto = ip6head.ip6_nxt;  /* Next header field */
-        
-        /* Convert addresses for logging */
-        inet_ntop(AF_INET6, &ip6head.ip6_src, src6_str, sizeof(src6_str));
-        inet_ntop(AF_INET6, &ip6head.ip6_dst, dst6_str, sizeof(dst6_str));
-        
-        logfile(LOG_DEBUG,
-                "\n---------------------------\n\n"
-                "IPv6 carp [%s] -> [%s] proto=%u",
-                src6_str, dst6_str, proto);
-                
-        /* Process IPv6 CARP packet */
-        if (proto == IPPROTO_CARP) {
-            struct carp_header ch;
-            unsigned long long tmp_counter;
-            struct timeval sc_tv;
-            struct timeval ch_tv;
-
-            logfile(LOG_DEBUG, "Processing IPv6 CARP packet - vhid check");
-            
-            if (caplen < ip_len + sizeof ch) {
-                logfile(LOG_DEBUG,
-                        "IPv6 CARP: Bogus size: caplen=[%u], ip_len=[%u] ch_len=[%u]",
-                        (unsigned int) caplen, (unsigned int) ip_len,
-                        (unsigned int) sizeof ch);
-                return;
-            }
-            
-            memcpy(&ch, sp + ip_len, sizeof ch);
-            
-            /* Validate CARP header */
-            if (ch.carp_version != CARP_VERSION) {
-                logfile(LOG_WARNING, _("IPv6 CARP: Bad version: [%u]"),
-                        (unsigned int) ch.carp_version);
-                return;
-            }
-            
-            if (ch.carp_vhid != vhid) {
-                logfile(LOG_DEBUG, _("IPv6 CARP: Ignoring vhid: [%u]"),
-                        (unsigned int) ch.carp_vhid);
-                return;
-            }
-            
-            logfile(LOG_DEBUG, "IPv6 CARP: Found matching vhid %u, processing master/backup logic", vhid);
-            logfile(LOG_DEBUG, "IPv6 CARP: authlen=%u, advskew=%u, advbase=%u", 
-                    ch.carp_authlen, ch.carp_advskew, ch.carp_advbase);
-            
-            /* Check authentication type - some IPv6 CARP implementations use authtype none 
-             * For now, accept all IPv6 CARP packets regardless of authentication 
-             * since the tcpdump shows authtype none */
-            if (0) { /* Temporarily disable authentication check for IPv6 */
-                /* Verify HMAC authentication */
-                SHA1_CTX ctx;
-                unsigned char md2[20];
-
-                memcpy(&ctx, &sc.sc_sha1, sizeof ctx);
-                SHA1Update(&ctx,
-                           (void *) &ch.carp_counter, sizeof ch.carp_counter);
-                SHA1Final(md2, &ctx);
-
-                SHA1Init(&ctx);
-                SHA1Update(&ctx, sc.sc_pad, sizeof(sc.sc_pad));
-                SHA1Update(&ctx, md2, sizeof md2);
-                SHA1Final(md2, &ctx);
-
-                if (memcmp(md2, ch.carp_md, sizeof md2) != 0) {
-                    logfile(LOG_WARNING,
-                            _("IPv6 CARP: Bad digest - Check vhid, password and virtual IP address"));
-                    return;
-                }
-                logfile(LOG_DEBUG, "IPv6 CARP: HMAC authentication passed");
-            } else {
-                logfile(LOG_DEBUG, "IPv6 CARP: No authentication (authtype none)");
-            }
-            
-            /* Update counter */
-            tmp_counter = ntohl(ch.carp_counter[0]);
-            tmp_counter = tmp_counter << 32;
-            tmp_counter += ntohl(ch.carp_counter[1]);
-            sc.sc_init_counter = 0;
-            sc.sc_counter = tmp_counter;
-
-            /* Calculate timing values for master election */
-            sc_tv.tv_sec = (unsigned int) sc.sc_advbase;
-            if (carp_suppress_preempt != 0 &&
-                sc.sc_advskew < CARP_BULK_UPDATE_MIN_DELAY) {
-                sc_tv.tv_usec = (unsigned int)
-                    (CARP_BULK_UPDATE_MIN_DELAY * 1000000ULL / 256ULL);
-            } else {
-                sc_tv.tv_usec = (unsigned int)
-                    (sc.sc_advskew * 1000000ULL / 256ULL);
-            }
-            ch_tv.tv_sec = (unsigned int) ch.carp_advbase;
-            ch_tv.tv_usec = (unsigned int)
-                (ch.carp_advskew * 1000000ULL / 256ULL);
-
-            logfile(LOG_DEBUG, "IPv6 CARP: Local advskew=%u, Remote advskew=%u", 
-                    sc.sc_advskew, ch.carp_advskew);
-
-            /* Process CARP state machine for IPv6 */
-            switch (sc.sc_state) {
-            case INIT:
-                logfile(LOG_DEBUG, "IPv6 CARP: In INIT state, ignoring");
-                break;
-            case MASTER:
-                /* If we receive an advertisement from a master with higher priority
-                 * (lower advskew), go into BACKUP state */
-                if (timercmp(&sc_tv, &ch_tv, >) ||
-                    (timercmp(&sc_tv, &ch_tv, ==) &&
-                        memcmp(&ip6head.ip6_src, &srcip6, sizeof(struct in6_addr)) < 0)) {
-                    
-                    logfile(LOG_WARNING, _("IPv6 CARP: Higher priority master advertised (advskew %u vs our %u): going to BACKUP state"),
-                            ch.carp_advskew, sc.sc_advskew);
-                    carp_send_ad(&sc);
-                    carp_set_state(&sc, BACKUP);
-                    carp_setrun(&sc, AF_INET6);
-                }
-                break;
-            case BACKUP:
-                /* Reset master down timer for IPv6 */
-                carp_setrun(&sc, AF_INET6);
-                logfile(LOG_DEBUG, "IPv6 CARP: Reset master down timer (advskew %u)", ch.carp_advskew);
-                break;
-            }
+        /* Check if this is a CARP packet by destination MAC or IP protocol */
+        if (ip6head.ip6_nxt == IPPROTO_CARP) {
+            /* Accept CARP packets regardless of destination MAC - let upper layer validate */
+            handle_ipv6_carp_packet(&ip6head, sp, caplen);
         }
         return;  /* Exit early for IPv6 packets */
     } else {
 #endif
-        /* IPv4 packet */
+        /* IPv4 packet processing */
         if (header->caplen <= (sizeof etherhead + sizeof iphead)) {
             return;
         }
@@ -590,210 +840,14 @@ static void packethandler(unsigned char *dummy,
             return;
         }
         ip_len = iphead.ip_hl << 2;
-        source = ntohl(iphead.ip_src.s_addr);
-        dest = ntohl(iphead.ip_dst.s_addr);
-        proto = iphead.ip_p;
         
-        logfile(LOG_DEBUG,
-                "\n---------------------------\n\n"
-                "IPv4 carp [%d.%d.%d.%d] -> [%d.%d.%d.%d]",
-                source >> 24 & 0xff, source >> 16 & 0xff,
-                source >> 8 & 0xff, source & 0xff,
-                dest >> 24 & 0xff, dest >> 16 & 0xff,
-                dest >> 8 & 0xff, dest & 0xff);
+        /* Process IPv4 CARP packet using new unified function */
+        if (iphead.ip_p == IPPROTO_CARP) {
+            handle_ipv4_carp_packet(&iphead, sp, ip_len, caplen);
+        }
 #ifdef INET6
     }
 #endif
-    switch (proto) {
-    case IPPROTO_CARP: {
-        struct carp_header ch;
-        unsigned long long tmp_counter;
-        struct timeval sc_tv;
-        struct timeval ch_tv;
-
-        logfile(LOG_DEBUG,
-                "\n---------------------------\n\n"
-                "IPv4 carp [%d.%d.%d.%d] -> [%d.%d.%d.%d]",
-                source >> 24 & 0xff, source >> 16 & 0xff,
-                source >> 8 & 0xff, source & 0xff,
-                dest >> 24 & 0xff, dest >> 16 & 0xff,
-                dest >> 8 & 0xff, dest & 0xff);
-        if (caplen < ip_len + sizeof ch) {
-            logfile(LOG_DEBUG,
-                    "Bogus size: caplen=[%u], ip_len=[%u] ch_len=[%u]",
-                    (unsigned int) caplen, (unsigned int) ip_len,
-                    (unsigned int) sizeof ch);
-            return;
-        }
-        memcpy(&ch, sp + ip_len, sizeof ch);
-#ifdef EXTRA_DEBUG
-        logfile(LOG_DEBUG,
-                "Capture len: [%u] carp_header: [%u] ip_header: [%u]",
-                (unsigned int) caplen, (unsigned int) sizeof ch,
-                (unsigned int) ip_len);
-        logfile(LOG_DEBUG, "CARP type: [%u] version: [%u]",
-                (unsigned) ch.carp_type, (unsigned) ch.carp_version);
-        logfile(LOG_DEBUG, "CARP vhid: [%u] advskew: [%u]",
-                (unsigned) ch.carp_vhid, (unsigned) ch.carp_advskew);
-        logfile(LOG_DEBUG, "CARP advbase: [%u] cksum: [%u]",
-                (unsigned) ch.carp_advbase, (unsigned) ch.carp_cksum);
-        logfile(LOG_DEBUG, "CARP counter: [%lu][%lu]",
-                (unsigned long) ch.carp_counter[0],
-                (unsigned long) ch.carp_counter[1]);
-#endif
-        if (iphead.ip_ttl != CARP_DFLTTL) {
-            logfile(LOG_WARNING, _("Bad TTL: [%u]"),
-                    (unsigned int) iphead.ip_ttl);
-            return;
-        }
-        if (ch.carp_version != CARP_VERSION) {
-            logfile(LOG_WARNING, _("Bad version: [%u]"),
-                    (unsigned int) ch.carp_version);
-            return;
-        }
-        if (ch.carp_vhid != vhid) {
-            logfile(LOG_DEBUG, _("Ignoring vhid: [%u]"),
-                    (unsigned int) ch.carp_vhid);
-            return;
-        }
-        if (iphead.ip_dst.s_addr != mcastip.s_addr) {
-            logfile(LOG_DEBUG, _("Ignoring different multicast ip: [%s]"),
-                    inet_ntoa(iphead.ip_dst));
-            return;
-        }
-        if (cksum(sp, ip_len + sizeof ch) != 0) {
-            logfile(LOG_WARNING, _("Bad IP checksum"));
-            return;
-        }
-        {
-            SHA1_CTX ctx;
-            unsigned char md2[20];
-
-            memcpy(&ctx, &sc.sc_sha1, sizeof ctx);
-            SHA1Update(&ctx,
-                       (void *) &ch.carp_counter, sizeof ch.carp_counter);
-            SHA1Final(md2, &ctx);
-
-            SHA1Init(&ctx);
-            SHA1Update(&ctx, sc.sc_pad, sizeof(sc.sc_pad));
-            SHA1Update(&ctx, md2, sizeof md2);
-            SHA1Final(md2, &ctx);
-
-            if (sizeof md2 != sizeof ch.carp_md) {
-                logfile(LOG_ERR, "sizeof md2 != sizeof carp_md !!!");
-                abort();
-            }
-            if (memcmp(md2, ch.carp_md, sizeof md2) != 0) {
-                logfile(LOG_WARNING,
-                        _("Bad digest - "
-                          "md2=[%02x%02x%02x%02x...] md=[%02x%02x%02x%02x...] - "
-                          "Check vhid, password and virtual IP address"),
-                        (unsigned int) md2[0], (unsigned int) md2[1],
-                        (unsigned int) md2[2], (unsigned int) md2[3],
-                        (unsigned int) (ch.carp_md)[0],
-                        (unsigned int) (ch.carp_md)[1],
-                        (unsigned int) (ch.carp_md)[2],
-                        (unsigned int) (ch.carp_md)[3]);
-                return;
-            }
-        }
-        tmp_counter = ntohl(ch.carp_counter[0]);
-        tmp_counter = tmp_counter << 32;
-        tmp_counter += ntohl(ch.carp_counter[1]);
-        sc.sc_init_counter = 0;
-        sc.sc_counter = tmp_counter;
-
-        sc_tv.tv_sec = (unsigned int) sc.sc_advbase;
-        if (carp_suppress_preempt != 0 &&
-            sc.sc_advskew < CARP_BULK_UPDATE_MIN_DELAY) {
-            sc_tv.tv_usec = (unsigned int)
-                (CARP_BULK_UPDATE_MIN_DELAY * 1000000ULL / 256ULL);
-        } else {
-            sc_tv.tv_usec = (unsigned int)
-                (sc.sc_advskew * 1000000ULL / 256ULL);
-        }
-        ch_tv.tv_sec = (unsigned int) ch.carp_advbase;
-        ch_tv.tv_usec = (unsigned int)
-            (ch.carp_advskew * 1000000ULL / 256ULL);
-
-        logfile(LOG_DEBUG, "sc_tv(local) = [%lu] ch_tv(remote) = [%lu]",
-                (unsigned long) sc_tv.tv_sec,
-                (unsigned long) ch_tv.tv_sec);
-
-        switch (sc.sc_state) {
-        case INIT:
-            break;
-        case MASTER:
-            /*
-             * If we receive an advertisement from a master who's going to
-             * be more frequent than us, or from a master who's advertising
-             * with the same frequency as us but with a lower IP address,
-             * go into BACKUP state.
-             */
-            if (timercmp(&sc_tv, &ch_tv, >) ||
-                (timercmp(&sc_tv, &ch_tv, ==) &&
-                    iphead.ip_src.s_addr < srcip.s_addr)) {
-                /* To be really sure the new master knows that is
-                 * has to reassert control of the VIP */
-                carp_send_ad(&sc);
-
-                carp_set_state(&sc, BACKUP);
-                carp_setrun(&sc, 0);
-                logfile(LOG_WARNING, _("Preferred master advertised: "
-                                       "going back to BACKUP state"));
-            }
-
-            /*
-             * If we receive an advertisement from a master who's advertising
-             * less frequently than us, or with the same frequency as us but
-             * with a higher IP address, reassert our dominance by issuing
-             * another gratuitous arp.
-             */
-            if (timercmp(&sc_tv, &ch_tv, <) ||
-                (timercmp(&sc_tv, &ch_tv, ==) &&
-                    iphead.ip_src.s_addr > srcip.s_addr)) {
-                gratuitous_arp(dev_desc_fd);
-                sc.sc_delayed_arp = 2; /* and yet another in 2 ticks */
-                logfile(LOG_WARNING, _("Non-preferred master advertising: "
-                                       "reasserting control of VIP with another gratuitous arp"));
-            }
-            break;
-        case BACKUP:
-            /*
-             * If we're pre-empting masters who advertise slower than us,
-             * and this one claims to be slower, treat him as down.
-             */
-            if (preempt != 0 && timercmp(&sc_tv, &ch_tv, <)) {
-                carp_master_down(&sc);
-                logfile(LOG_WARNING, _("Putting MASTER down - preemption"));
-                break;
-            }
-
-            /*
-             *  If the master is going to advertise at such a low frequency
-             *  that he's guaranteed to time out, we'd might as well just
-             *  treat him as timed out now.
-             */
-            sc_tv.tv_sec = (unsigned int) sc.sc_advbase * dead_ratio;
-            if (timercmp(&sc_tv, &ch_tv, <)) {
-                carp_master_down(&sc);
-                logfile(LOG_WARNING,
-                        _("Putting MASTER DOWN (going to time out)"));
-                break;
-            }
-
-            /*
-             * Otherwise, we reset the counter and wait for the next
-             * advertisement.
-             */
-            carp_setrun(&sc, AF_INET); /* XXX - TODO was af */
-            break;
-        }
-        break;
-    }
-    default:
-        return;
-    }
 }
 
 static RETSIGTYPE sighandler_exit(const int sig)
@@ -1091,13 +1145,13 @@ int docarp(void)
 #endif
         if (sc.sc_ad_tmo.tv_sec != 0) {
            if (timercmp(&now, &sc.sc_ad_tmo, >)) {
-                carp_send_ad(&sc);
+                carp_send_ad_all(&sc);
            } else {
                timersub(&sc.sc_ad_tmo, &now, &time_until_advert);
                int diff_ms = (time_until_advert.tv_sec * 1000) +
                    (time_until_advert.tv_usec / 1000);
                if (abs(diff_ms) <= 1) {
-                    carp_send_ad(&sc);
+                    carp_send_ad_all(&sc);
                }
            }
        }

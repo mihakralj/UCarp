@@ -9,4 +9,8 @@ static int carp_suppress_preempt;
 
 static void carp_send_ad_all(struct carp_softc *sc);
 
+#ifdef INET6
+static void carp_send_ad_ipv6(struct carp_softc *sc);
+#endif
+
 #endif

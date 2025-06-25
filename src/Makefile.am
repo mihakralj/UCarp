@@ -21,10 +21,12 @@ ucarp_SOURCES = \
 	fillmac.h \
 	bsd-getopt_long.h \
 	bsd-getopt_long.c \
-	garp.c \
-	garp.h \
-	spawn.c \
-	spawn.h \
+garp.c \
+garp.h \
+ndp.c \
+ndp.h \
+spawn.c \
+spawn.h \
 	fakesnprintf.c \
 	fakesnprintf.h \
 	mysnprintf.c \
@@ -37,4 +39,3 @@ ucarp_SOURCES = \
 
 ucarp_LDADD = \
 	$(LTLIBINTL)
-
